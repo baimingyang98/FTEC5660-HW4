@@ -33,6 +33,296 @@ load_dotenv()
 # Your code: add imports, constants and helper functions here.
 # =============================================================================
 
+from bs4 import BeautifulSoup, NavigableString, Tag
+from rank_bm25 import BM25Okapi
+
+# Switches for the ablation study (ablation.py turns them off one at a time). The defaults are the
+# submitted pipeline; with every switch off, the pipeline is the naive baseline B0.
+SETTINGS: dict[str, Any] = {
+    "table_text": True,       # tables through table_to_text (off: BeautifulSoup's get_text, a stream of cells)
+    "section_chunks": True,   # chunks follow the headings (off: RecursiveCharacterTextSplitter over the text)
+    "chunk_header": True,     # each chunk starts with "company | document | section"
+    "tokenizer": "stemmed",   # "stemmed": words without punctuation, light stemming; "whitespace": text.lower().split()
+    "query_words": True,      # BM25 query: content words, synonyms, abbreviations (off: the whole question)
+    "metadata_filter": True,  # parse_query, then only chunks of the companies, years and document type asked about
+    "per_company": True,      # a comparison takes the best chunks of each company in turn
+    "table_boost": 1.3,       # BM25 factor for chunks with a table when the question asks for a figure (1.0: off)
+    "abstain": True,          # return [] when the corpus cannot answer
+}
+CHUNK_OVERLAP = 200       # RecursiveCharacterTextSplitter overlap, as in Tutorial 7 (baseline only)
+
+LINE_LIMIT = 380          # Task 1.1 counts a line only up to 400 characters; keep a margin
+MIN_CHUNK_CHARS = 250     # a section shorter than this joins the next section of the same part
+HEADING_TAGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
+TEXT_TAGS = {"p", "caption", "blockquote", "pre", "dt", "dd", "figcaption", "address"}
+SKIP_TAGS = {"nav", "script", "style", "head", "noscript", "button", "form"}
+SKIP_SECTIONS = {"contents", "table of contents"}
+SUFFIX_WORDS = {"inc", "corp", "corporation", "ltd", "limited", "plc", "llc", "co"}  # as in company_key()
+DOC_LABELS = {"annual_report": "Annual report", "earnings_call": "Earnings call",
+              "research_report": "Research report"}
+
+
+def _clean(text: str) -> str:
+    """Collapse whitespace (including non-breaking spaces) to single spaces."""
+    return " ".join(str(text).split())
+
+
+def _expand_row(tr: Tag, repeat: bool = False) -> list[str]:
+    """The text of each cell of a row, spread over its colspan so that it lines up with the header.
+
+    A header cell is repeated in every column it spans; a body cell fills only its first column.
+    """
+    texts = []
+    for cell in tr.find_all(["td", "th"], recursive=False):
+        try:
+            span = max(1, int(cell.get("colspan", 1)))
+        except (TypeError, ValueError):
+            span = 1
+        text = _clean(cell.get_text(" ", strip=True))
+        texts.extend([text] + [text if repeat else ""] * (span - 1))
+    return texts
+
+
+def _row_lines(label: str, pairs: list[str]) -> list[str]:
+    """One line per row; a row too long for one line is split, and every part repeats the row label."""
+    line = " | ".join([label, *pairs]) if label else " | ".join(pairs)
+    if len(line) <= LINE_LIMIT or len(pairs) <= 1:
+        return [line]
+    lines, current = [], []
+    for pair in pairs:
+        if current and len(" | ".join([label, *current, pair])) > LINE_LIMIT:
+            lines.append(" | ".join([label, *current]))
+            current = []
+        current.append(pair)
+    lines.append(" | ".join([label, *current]))
+    return lines
+
+
+def _table_lines(table: Tag) -> list[str]:
+    """table_to_text for a parsed <table>: caption, then one line per row with column headers."""
+    lines = []
+    caption = table.find("caption")
+    if caption is not None and _clean(caption.get_text(" ", strip=True)):
+        lines.append(_clean(caption.get_text(" ", strip=True)))
+
+    rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+    header_rows = [tr for tr in rows if tr.find_parent("thead") is not None]
+    if not header_rows and rows and rows[0].find("td") is None and len(rows[0].find_all("th")) > 1:
+        header_rows = [rows[0]]  # no <thead>: a first row of <th> cells is the header
+    body_rows = [tr for tr in rows if tr not in header_rows]
+
+    # Column headers; several header rows are joined per column ("2025 Q4").
+    headers: list[str] = []
+    for tr in header_rows:
+        for j, text in enumerate(_expand_row(tr, repeat=True)):
+            if j >= len(headers):
+                headers.append(text)
+            elif text and text not in headers[j]:
+                headers[j] = f"{headers[j]} {text}".strip()
+
+    for tr in body_rows:
+        cells = _expand_row(tr)
+        filled = [c for c in cells if c]
+        if not filled:
+            continue
+        if len(filled) == 1:  # a section row such as "Current assets", or a one-cell row
+            lines.append(filled[0])
+            continue
+        label, pairs = cells[0], []
+        for j, value in enumerate(cells[1:], start=1):
+            if not value:
+                continue
+            header = headers[j] if j < len(headers) and headers[j] else f"Column {j + 1}"
+            pairs.append(f"{header}: {value}")
+        lines.extend(_row_lines(label, pairs))
+    return lines
+
+
+def _strip_suffix(name: str) -> str:
+    """'Northgate Robotics Inc.' -> 'Northgate Robotics'; also drops a trailing '(TSX: BWE)'."""
+    name = _clean(re.sub(r"\s*\([^)]*\)\s*$", "", name))
+    words = name.split()
+    while len(words) > 1 and re.sub(r"[^a-z]", "", words[-1].lower()) in SUFFIX_WORDS:
+        words.pop()
+    return " ".join(words).rstrip(",")
+
+
+def _document_meta(soup: BeautifulSoup) -> tuple[str, int | None, str]:
+    """(company, fiscal_year, doc_type) from the first lines of a document."""
+    body = soup.body or soup
+    for tag in body.find_all(SKIP_TAGS):
+        tag.decompose()
+    head = _clean(body.get_text(" ", strip=True))[:400]
+    low = head.lower()
+
+    if re.search(r"earnings\s+(conference\s+)?call", low):
+        doc_type = "earnings_call"
+    elif re.search(r"results\s+review|equity\s+research|target\s+price|\brating\b", low):
+        doc_type = "research_report"
+    else:
+        doc_type = "annual_report"
+
+    patterns = {
+        "annual_report": [r"annual\s+report\s+(?:fy\s*)?(\d{4})", r"fiscal\s+year\s+ended[^0-9]*?\d{1,2}\s+\w+\s+(\d{4})"],
+        "earnings_call": [r"full\s+year\s+(?:fy\s*)?(\d{4})", r"\bfy\s*(\d{4})", r"(?:q4|fourth\s+quarter)\D{0,30}(\d{4})"],
+        "research_report": [r"\bfy\s*(\d{4})\s*results", r"results\s+review\D{0,20}(\d{4})", r"\bfy\s*(\d{4})"],
+    }[doc_type]
+    fiscal_year = None
+    for pattern in patterns:
+        found = re.search(pattern, low)
+        if found:
+            fiscal_year = int(found.group(1))
+            break
+    if fiscal_year is None:
+        years = re.findall(r"\b(20\d{2})\b", low)
+        fiscal_year = int(years[0]) if years else None
+
+    h1 = body.find("h1")
+    if h1 is not None:
+        company = h1.get_text(" ", strip=True)
+    elif soup.title is not None:
+        company = soup.title.get_text(" ", strip=True).split("|")[0]
+    else:
+        company = head[:60]
+    return _strip_suffix(company), fiscal_year, doc_type
+
+
+def _blocks(node: Tag):
+    """The document in reading order as ("heading", level, text), ("text", text) or ("table", lines)."""
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            if type(child) is NavigableString and _clean(child):
+                yield ("text", _clean(child))
+            continue
+        if not isinstance(child, Tag) or child.name in SKIP_TAGS:
+            continue
+        name = child.name
+        if name == "table":
+            if SETTINGS["table_text"]:
+                yield ("table", _table_lines(child))
+            else:  # naive extraction: one cell per line, the link between value, row and column is lost
+                yield ("table", [_clean(t) for t in child.get_text("\n", strip=True).split("\n") if _clean(t)])
+        elif name in HEADING_TAGS:
+            yield ("heading", HEADING_TAGS[name], _clean(child.get_text(" ", strip=True)))
+        elif name in ("ul", "ol"):
+            for li in child.find_all("li", recursive=False):
+                text = _clean(li.get_text(" ", strip=True))
+                if text:
+                    yield ("text", f"- {text}")
+        elif name in TEXT_TAGS or (name in ("div", "span", "li", "section") and not child.find(
+                ["p", "div", "table", "ul", "ol", "section"] + list(HEADING_TAGS))):
+            text = _clean(child.get_text(" ", strip=True))
+            if text:
+                yield ("speaker" if "speaker" in (child.get("class") or []) else "text", text)
+        else:
+            yield from _blocks(child)
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """Split a long paragraph at sentence ends (or, failing that, at spaces) into pieces <= limit."""
+    if len(text) <= limit:
+        return [text]
+    pieces, current = [], ""
+    for sentence in re.split(r"(?<=[.!?;])\s+", text):
+        while len(sentence) > limit:  # a sentence longer than the limit: cut at a space
+            cut = sentence.rfind(" ", 0, limit) if " " in sentence[:limit] else limit
+            cut = cut if cut > 0 else limit
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(sentence[:cut])
+            sentence = sentence[cut:].strip()
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            pieces.append(current)
+            current = sentence
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _split_table(lines: list[str], limit: int) -> list[str]:
+    """Split table text into pieces <= limit at row boundaries; every piece repeats the caption.
+
+    A piece preferably ends before a section row ("Liabilities and equity"), so that the section
+    row starts the next piece together with its rows.
+    """
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return [text]
+    caption = lines[0] if lines else ""
+    parts = [part for line in lines[1:] for part in _split_text(line, limit - len(caption) - 1)]
+    pieces, current = [], [caption]
+    for part in parts:
+        if len("\n".join(current + [part])) > limit and len(current) > 1:
+            # back up to the last section row (a line without "|") if it is not the first row
+            cut = next((i for i in range(len(current) - 1, 1, -1) if " | " not in current[i]), None)
+            if cut and len("\n".join([caption, *current[cut:], part])) <= limit:
+                pieces.append("\n".join(current[:cut]))
+                current = [caption, *current[cut:]]
+            else:
+                pieces.append("\n".join(current))
+                current = [caption]
+        current.append(part)
+    pieces.append("\n".join(current))
+    return pieces
+
+
+def _recursive_chunks(soup: BeautifulSoup, base: dict, head: str) -> list[Document]:
+    """Baseline chunking (ablation only): the whole text, split by RecursiveCharacterTextSplitter."""
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    if SETTINGS["table_text"]:
+        for table in soup.find_all("table"):
+            table.replace_with(NavigableString("\n" + "\n".join(_table_lines(table)) + "\n"))
+    text = soup.get_text("\n", strip=True)
+    head = head if SETTINGS["chunk_header"] else ""
+    size = MAX_CHUNK_CHARS - (len(head) + 1 if head else 0)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=CHUNK_OVERLAP)
+    return [Document(page_content=(head + "\n" if head else "") + piece,
+                     metadata={**base, "section": "", "has_table": False, "chunk": i})
+            for i, piece in enumerate(splitter.split_text(text))]
+
+
+# ----------------------------------------------------------------------------- what chunk_document found
+
+# Filled by chunk_document (the runner calls it on every document before parse_query) and again by
+# build_index from the chunk metadata: the companies of the corpus, and names that are not companies.
+KNOWN_COMPANIES: dict[str, str] = {}   # company key -> name as in the metadata
+KNOWN_BROKERS: set[str] = set()        # research report authors and analysts' employers (keys)
+KNOWN_ORGS: set[str] = set()           # brokers, audit firms and other names that are not companies (keys)
+KNOWN_PEOPLE: set[str] = set()         # directors, officers, call participants (keys)
+KNOWN_TEXTS: set[str] = set()          # every document, normalised, to look names up
+
+
+def _register(company: str, doc_type: str, lines: list[str]) -> None:
+    """Remember the company of a document and the brokers, audit firms and people it names."""
+    if company:
+        KNOWN_COMPANIES.setdefault(company_key(company), company)
+    KNOWN_TEXTS.add(normalize("\n".join(lines)))
+    for line in lines:
+        if doc_type == "research_report":
+            found = re.match(r"^(.+?)\s*\|\s*Equity Research\b", line)
+            if found:
+                KNOWN_BROKERS.add(company_key(found.group(1)))
+        # audit firms: the capitalised name right before "audited", or any name ending in LLP or LLC
+        for found in re.finditer(r"((?:[A-Z][\w&'.-]*\s+){0,4}[A-Z][\w&'.-]*)\s+(?:has\s+)?audited\b", line):
+            KNOWN_ORGS.add(company_key(found.group(1)))
+        for found in re.finditer(r"((?:[A-Z][\w&'.-]*\s+){1,4}(?:LLP|LLC))\b", line):
+            KNOWN_ORGS.add(company_key(found.group(1)))
+        found = re.match(r"^- ([A-Z][\w.'-]+(?: [A-Z][\w.'-]+){1,3}) - (.+)$", line)  # "- Ivan Xu - Harbourline Securities"
+        if found:
+            KNOWN_PEOPLE.add(company_key(found.group(1)))
+            if not any(w in TITLE_WORDS for w in company_key(found.group(2)).split()):
+                KNOWN_BROKERS.add(company_key(found.group(2)))  # an analyst's employer, not a job title
+    KNOWN_ORGS.update(KNOWN_BROKERS)
+    for line in lines:
+        found = re.match(r"^([A-Z][\w.'-]+(?: [A-Z][\w.'-]+){1,3}) \| (?:Role|Title): ", line)  # board, executives
+        if found:
+            KNOWN_PEOPLE.add(company_key(found.group(1)))
+
 
 def table_to_text(table_html: str) -> str:
     """Task 1.1: turn one HTML <table> into text that keeps every value with its row and its column.
@@ -43,7 +333,11 @@ def table_to_text(table_html: str) -> str:
     LLM here.
     """
     ### YOUR CODE HERE
-    return ""
+    soup = BeautifulSoup(table_html, "lxml")
+    table = soup.find("table")
+    if table is None:
+        return _clean(soup.get_text(" ", strip=True))
+    return "\n".join(_table_lines(table))
 
 
 def chunk_document(file_name: str, html: str) -> list[Document]:
@@ -53,7 +347,464 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     "doc_type" (one of DOC_TYPES). Do not call the LLM here.
     """
     ### YOUR CODE HERE
-    return []
+    soup = BeautifulSoup(html, "lxml")
+    company, fiscal_year, doc_type = _document_meta(soup)
+    label = f"{DOC_LABELS[doc_type]} FY{fiscal_year}" if fiscal_year else DOC_LABELS[doc_type]
+    base = {"source": file_name, "company": company, "fiscal_year": fiscal_year, "doc_type": doc_type}
+
+    if not SETTINGS["section_chunks"]:  # the baseline: fixed-size pieces of the whole text
+        chunks = _recursive_chunks(BeautifulSoup(html, "lxml"), base, f"{company} | {label}")
+        _register(company, doc_type, [line for c in chunks for line in c.page_content.split("\n")])
+        return chunks
+
+    chunks: list[Document] = []
+    titles: dict[int, str] = {}  # heading level -> current title (h2 and below)
+    buffer: list[str] = []
+    buffer_titles: list[str] = []  # the section path of the chunk being filled
+    has_table = False
+    skipping = False
+    speaker = ""
+
+    def path() -> list[str]:
+        return [titles[level] for level in sorted(titles)]
+
+    def header(parts: list[str]) -> str:
+        if not SETTINGS["chunk_header"]:
+            return ""
+        return " | ".join(part for part in (company, label, " > ".join(parts)) if part)
+
+    def flush() -> None:
+        nonlocal buffer, has_table
+        if buffer:
+            head = header(buffer_titles)
+            chunks.append(Document(page_content=(head + "\n" if head else "") + "\n".join(buffer),
+                                   metadata={**base, "section": " > ".join(buffer_titles),
+                                             "has_table": has_table, "chunk": len(chunks)}))
+        buffer, has_table = [], False
+
+    def add(text: str, is_table: bool) -> None:
+        nonlocal has_table, buffer_titles
+        if not buffer:
+            buffer_titles = path()
+        room = MAX_CHUNK_CHARS - max(len(header(buffer_titles)), len(header(path()))) - 1
+        pieces = _split_table(text.split("\n"), room) if is_table else _split_text(text, room)
+        for piece in pieces:
+            if buffer and len("\n".join(buffer + [piece])) > room:
+                flush()
+                buffer_titles = path()
+            buffer.append(piece)
+            has_table = has_table or is_table
+
+    for kind, *rest in _blocks(soup.body or soup):
+        if kind == "heading":
+            level, title = rest
+            if level == 1:  # the document title belongs to the opening chunk
+                if not skipping:
+                    add(title, False)
+                continue
+            speaker = ""
+            new_titles = {k: v for k, v in titles.items() if k < level}
+            new_titles[level] = title
+            new_skip = title.lower() in SKIP_SECTIONS or (level > 2 and skipping)
+            opening = not buffer_titles
+            same_part = level > 2 and buffer_titles[:1] == [titles.get(2)]
+            if buffer and not new_skip and len("\n".join(buffer)) < MIN_CHUNK_CHARS and (opening or same_part):
+                # a short section joins the next one; the heading stays in the text as a line
+                titles, skipping = new_titles, new_skip
+                common = 0
+                while common < min(len(buffer_titles), len(path())) and buffer_titles[common] == path()[common]:
+                    common += 1
+                if buffer_titles[common:]:  # the title dropped from the header moves into the text
+                    buffer.insert(0, " > ".join(buffer_titles[common:]))
+                buffer_titles = buffer_titles[:common]
+                buffer.append(title)
+                continue
+            flush()
+            titles, skipping = new_titles, new_skip
+            continue
+        if skipping:
+            continue
+        if kind == "table":
+            if speaker:
+                add(speaker, False)
+                speaker = ""
+            add("\n".join(rest[0]), True)
+        elif kind == "speaker":
+            if speaker:
+                add(speaker, False)
+            speaker = rest[0]
+        else:
+            text = f"{speaker}: {rest[0]}" if speaker else rest[0]
+            speaker = ""
+            add(text, False)
+    if speaker:
+        add(speaker, False)
+    flush()
+    _register(company, doc_type, [line for c in chunks for line in c.page_content.split("\n")])
+    return chunks
+
+
+# ----------------------------------------------------------------------------- query parsing
+
+MONTHS = {"january", "february", "march", "april", "may", "june", "july", "august", "september",
+          "october", "november", "december"}
+# Capitalised words that start or end a name but are not part of a company name.
+NOT_NAME_WORDS = MONTHS | {
+    "what", "which", "who", "whom", "whose", "how", "when", "where", "why", "in", "on", "at", "for", "of",
+    "did", "does", "do", "was", "were", "is", "are", "the", "a", "an", "its", "their", "by", "from",
+    "according", "during", "as", "and", "or", "to", "with", "between", "usd", "hkd", "eur", "gbp", "cny",
+    "rmb", "jpy", "ifrs", "gaap", "eps", "ceo", "cfo", "coo", "cto", "q1", "q2", "q3", "q4", "h1", "h2"}
+TITLE_WORDS = {"chief", "officer", "executive", "financial", "operating", "technology", "chair", "chairman",
+               "chairwoman", "director", "directors", "president", "counsel", "secretary", "head", "board",
+               "committee", "investor", "relations", "treasurer", "controller"}
+ORG_WORDS = {"securities", "capital", "research", "partners", "llp", "bank", "advisors", "advisers",
+             "brokers", "markets", "investments", "equity"}
+CONNECTORS = {"of", "and", "&"}
+UNIT_WORDS = {"segment", "segments", "division", "business", "unit", "region", "brand", "subsidiary"}
+
+
+def _name_spans(question: str) -> list[tuple[str, bool, int]]:
+    """Runs of capitalised words, cut at words that cannot be part of a company name.
+
+    "of", "and" and "&" between capitalised words stay in the run. Returns (name, possessive, end
+    position) for every run.
+    """
+    text = question.replace("’", "'")
+    spans = []
+    for run in re.finditer(r"[A-Z][\w&.\-]*(?:\s+(?:(?:of|and|&)\s+)?[A-Z][\w&.\-]*)*", text):
+        words, start = [], run.start()
+        for word in re.finditer(r"\S+", run.group(0)):
+            token = word.group(0).strip(".,")
+            low = token.lower()
+            if low in CONNECTORS:
+                words.append(token)
+            elif low in NOT_NAME_WORDS or re.fullmatch(r"fy\d*|\d+[a-z]*", low):
+                if words:
+                    spans.append((words, start + word.start()))
+                words = []
+            else:
+                words.append(token)
+        if words:
+            spans.append((words, run.end()))
+    result = []
+    for words, end in spans:
+        while words and words[-1].lower() in CONNECTORS:
+            words = words[:-1]
+        while words and words[0].lower() in CONNECTORS:
+            words = words[1:]
+        if not words:
+            continue
+        name = " ".join(words)
+        possessive = text[end:end + 2] in ("'s", "' ") or text[end:end + 1] == "'" or name.endswith("'")
+        result.append((name.rstrip("'"), possessive, end))
+    return result
+
+
+def _in_corpus(name: str) -> bool:
+    """The name occurs, as whole words, in some document of the corpus."""
+    phrase = normalize(name)
+    return any(phrase in text for text in KNOWN_TEXTS)
+
+
+def _as_company(name: str, possessive: bool, after: str, compared: set[str]) -> str | None:
+    """The company a name in the question refers to, or None if it is not a company."""
+    key = company_key(name)
+    words = key.split()
+    if not words or key in KNOWN_ORGS or key in KNOWN_PEOPLE:
+        return None
+    if key not in KNOWN_COMPANIES and re.fullmatch(r"[A-Z0-9&/.\-]{1,6}", name):
+        return None  # an abbreviation or a ticker: R&D, EPS, SG&A, NGR
+    if words[-1] in ORG_WORDS or any(w in TITLE_WORDS for w in words):
+        return None
+    if key in KNOWN_COMPANIES or key in compared:
+        return name
+    # a known company followed by a segment name: "Brightwater Energy Midstream segment"
+    prefix = next((k for k in KNOWN_COMPANIES if k and key.startswith(k + " ")), None)
+    if prefix and re.match(r"(s\s+)?(" + "|".join(UNIT_WORDS) + r")\b", after):
+        return KNOWN_COMPANIES[prefix]
+    # a company that is not in the corpus: it looks like one that is ("Halcyon Air Cargo"), it is
+    # in the possessive, or the documents never mention it (segments, regions and people they do)
+    known_first = {k.split()[0] for k in KNOWN_COMPANIES if k}
+    if len(words) >= 2 and (words[0] in known_first or possessive or not _in_corpus(name)):
+        return name
+    if len(words) == 1 and possessive and not _in_corpus(name):
+        return name
+    return None
+
+
+def _parse_companies(question: str) -> list[str]:
+    compared: set[str] = set()
+    for pattern in (r":\s*(.+?)\s+or\s+(.+?)\s*\?*\s*$", r"\b[Bb]etween\s+(.+?)\s+and\s+(.+?)\s*[,?]"):
+        found = re.search(pattern, question)
+        if found:
+            compared |= {company_key(n) for n in found.groups()}
+    companies: list[str] = []
+    for name, possessive, end in _name_spans(question):
+        after = question[end:].lstrip(" '’").lower()
+        parts = [(name, possessive)]
+        if re.search(r"\s(?:and|&)\s", name) and company_key(name) not in KNOWN_COMPANIES:
+            # "Northgate Robotics and Northgate Payments": two companies if both parts are companies
+            pieces = re.split(r"\s+(?:and|&)\s+", name)
+            flags = [False] * (len(pieces) - 1) + [possessive]
+            if all(_as_company(p, f, "", compared) for p, f in zip(pieces, flags)):
+                parts = list(zip(pieces, flags))
+        for part, flag in parts:
+            company = _as_company(part, flag, after, compared)
+            if company:
+                companies.append(company)
+    unique: dict[str, str] = {}
+    for name in companies:
+        unique.setdefault(company_key(name), name)
+    return list(unique.values())
+
+
+def _parse_year(question: str) -> int | None:
+    found = re.search(r"\bFY\s?'?(\d{4}|\d{2})(?:[AE])?\b", question, re.I)
+    if found:
+        year = int(found.group(1))
+        return year + 2000 if year < 100 else year
+    found = re.search(r"\b(19\d{2}|20\d{2})\b", question)
+    return int(found.group(1)) if found else None
+
+
+def _parse_doc_type(question: str) -> str:
+    low = question.lower()
+    if re.search(r"earnings[\s-]+(?:conference\s+)?call|conference\s+call|\bon\s+(?:its|the)\s+(?:q4\s+|fourth[\s-]quarter\s+)?call\b", low):
+        return "earnings_call"
+    if re.search(r"\brating\b|target\s+price|price\s+target|forecast|\bestimates?\b|results\s+review|broker|"
+                 r"\banalysts?\b|equity\s+research|recommendation|upgrade|downgrade|\bprojects?\b", low):
+        return "research_report"
+    if any(broker and f" {broker} " in normalize(question) for broker in KNOWN_BROKERS):
+        return "research_report"  # a question that names a broker is about its research report
+    return "annual_report"
+
+
+# ----------------------------------------------------------------------------- lexical retrieval
+
+
+STOPWORDS = {
+    "a", "an", "the", "of", "in", "on", "at", "for", "to", "by", "from", "with", "and", "or", "as", "is",
+    "are", "was", "were", "be", "been", "it", "its", "their", "this", "that", "these", "those", "what",
+    "which", "who", "whom", "how", "much", "many", "did", "does", "do", "had", "has", "have", "end",
+    "usd", "million", "millions", "percent", "company", "companies", "value", "amount", "figure", "year",
+    "fiscal", "fy", "report", "reported", "hold", "held", "generate", "generated", "earn", "earned", "give",
+    "gives", "set", "sets", "announce", "announced", "spend", "spent", "more", "higher", "lower", "less",
+    "most", "highest", "lowest", "larger", "smaller", "december", "its", "s", "according", "during"} | MONTHS
+# Question words -> document words (the documents' wording comes first).
+SYNONYMS = {
+    "cash": ["cash", "equivalents"], "headcount": ["employees"], "staff": ["employees"],
+    "workforce": ["employees"], "people": ["employees"], "employ": ["employees"], "sales": ["revenue"],
+    "turnover": ["revenue"], "debt": ["borrowings"], "loans": ["borrowings"], "borrowed": ["borrowings"],
+    "cfo": ["chief", "financial", "officer"], "ceo": ["chief", "executive", "officer"],
+    "coo": ["chief", "operating", "officer"], "cto": ["chief", "technology", "officer"],
+    "auditor": ["audited", "independent", "auditor"], "audit": ["audited", "auditor"],
+    "audited": ["audited", "auditor"], "headquartered": ["headquarters"], "based": ["headquarters"],
+    "buyback": ["repurchase"], "buybacks": ["repurchase"], "repurchase": ["repurchase", "programme"],
+    "guide": ["expect", "guidance", "outlook", "guided"], "guidance": ["expect", "outlook", "guided"],
+    "outlook": ["expect", "guidance"], "forecast": ["estimate", "estimates"], "forecasts": ["estimate"],
+    "estimate": ["estimates"], "rating": ["rating"], "recommendation": ["rating"],
+    "profit": ["income", "profit"], "earnings": ["income", "eps"], "receivables": ["receivable"],
+    "inventory": ["inventories"], "stock": ["inventories"], "equity": ["equity"],
+}
+# Words that describe the answer rather than the evidence ("In which city ...", "Which audit firm ...").
+ANSWER_WORDS = {"city", "town", "country", "place", "location", "firm", "person", "name", "named", "who",
+                "large", "big", "small", "size", "figure", "amount", "number", "level", "date", "day",
+                "month", "time", "percentage", "pay", "paid", "record", "recorded", "symbol", "code",
+                "post", "posted", "achieve", "achieved", "reach", "reached", "disclose", "disclosed",
+                "show", "shown", "state", "stated", "say", "said", "mention", "mentioned", "make", "made",
+                "assign", "assigned", "publish", "published", "issue", "issued", "raise", "raised",
+                "lower", "lowered", "cut", "increase", "increased", "decrease", "decreased",
+                # when, how and from whom: these describe the question, not the figure
+                "previous", "previously", "prior", "earlier", "old", "new", "latest", "current", "recent",
+                "initial", "original", "revised", "updated", "project", "projected", "projection",
+                "expect", "expected", "anticipate", "anticipated", "predict", "predicted", "plan", "planned",
+                "broker", "brokers", "analyst", "analysts", "approximately", "roughly", "about", "around",
+                "exactly", "overall", "combined", "annual", "annually", "full", "whole", "start", "beginning",
+                "close", "closing", "ending", "ended", "compared", "versus", "vs", "change", "changed"}
+# Abbreviations in questions -> the words the documents use.
+ABBREVIATIONS = [
+    (r"\bR&D\b", "research and development"), (r"\bSG&A\b", "selling general and administrative"),
+    (r"\bPP&E\b", "property plant and equipment"), (r"\bD&A\b", "depreciation and amortisation"),
+    (r"\bM&A\b", "acquisitions"), (r"\bEPS\b", "earnings per share"), (r"\bP/E\b", "P/E price earnings"),
+    (r"\bcapex\b|\bcapital\s+expenditures?\b", "purchases of property plant and equipment"),
+    (r"\bQ4\b", "fourth quarter"), (r"\bYoY\b|\by/y\b", "year on year"), (r"\bIR\b", "investor relations"),
+]
+# American spellings -> the British spellings of the documents (applied to documents and questions).
+SPELLINGS = {"program": "programme", "programs": "programmes", "labor": "labour", "center": "centre",
+             "centers": "centres", "favorable": "favourable", "behavior": "behaviour"}
+NUMBER_TOKEN_RE = re.compile(r"\d")
+OTHER_DOC_RATIO = 1.3  # how much better a chunk of another kind of document must match to be added
+MAX_OTHER_DOCS = 2     # at most this many such chunks
+# A question that asks for a figure ("in USD millions", "how many") or compares figures ("higher net income").
+FIGURE_QUESTION = (r"\b(?:usd|hkd|eur|gbp|millions?|billions?|percent|how\s+much|how\s+many|"
+                   r"higher|lower|more|less|larger|smaller|greater|fewer|bigger)\b")
+
+
+def _stem(word: str) -> str:
+    """A light stemmer: plural, -ing, -ed and a final e ('employees' and 'employee' -> 'employe')."""
+    word = SPELLINGS.get(word, word)
+    if "iz" in word:  # amortization -> amortisation, organized -> organised
+        word = re.sub(r"iz(?=e|ed|es|ing|ation|ations)", "is", word)
+    if len(word) <= 3 or NUMBER_TOKEN_RE.search(word):
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        word = word[:-3] + "y"
+    elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        word = word[:-1]
+    for suffix in ("ing", "ed"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            word = word[:-len(suffix)]
+            break
+    if word.endswith("e") and len(word) > 4:
+        word = word[:-1]
+    return word
+
+
+def _tokens(text: str) -> list[str]:
+    """Lower-cased word and number tokens, stemmed. 'FY2025E' -> 'fy2025e', '2,710.4' -> '2,710.4'."""
+    text = unicodedata.normalize("NFKC", text).lower().replace("’", "'")
+    return [_stem(t) for t in re.findall(r"\d[\d,.]*\d|\d|[a-z][a-z0-9]*", text)]
+
+
+def _tokenize(text: str) -> list[str]:
+    """The BM25 tokens of a chunk or a query, by SETTINGS["tokenizer"]."""
+    if SETTINGS["tokenizer"] == "whitespace":
+        return text.lower().split()
+    return _tokens(text)
+
+
+def _query_words(question: str, companies: list[str]) -> list[str]:
+    """The content words of a question: no company names, years, units or question words."""
+    text = question.replace("’", "'")
+    for name in companies:
+        text = re.sub(re.escape(name) + r"(?:'s|')?", " ", text, flags=re.I)
+    for pattern, replacement in ABBREVIATIONS:
+        text = re.sub(pattern, replacement, text, flags=re.I)
+    words = []
+    for word in re.findall(r"[A-Za-z][A-Za-z\-]*", text.replace("’", "'")):
+        for part in word.lower().split("-"):
+            if part and part not in STOPWORDS and not re.fullmatch(r"fy\d*|q\d|\d+", part) and len(part) > 1:
+                words.append(part)
+    return words
+
+
+def _query_tokens(question: str, companies: list[str]) -> list[str]:
+    """The BM25 query: the content words of the question with their synonyms, or the whole question."""
+    if not SETTINGS["query_words"]:
+        return _tokenize(question)
+    words = _query_words(question, companies)
+    expanded = [w for word in words for w in (word, *SYNONYMS.get(word, []))]
+    return [t for w in expanded for t in _tokenize(w)] or _tokenize(question)
+
+
+class LexicalIndex:
+    """BM25 over all chunks, plus the chunks grouped by company, and what each company's documents cover."""
+
+    def __init__(self, chunks: list[Document]) -> None:
+        self.chunks = chunks
+        self.tokens = [_tokenize(c.page_content) for c in chunks]
+        self.bm25 = BM25Okapi(self.tokens, k1=1.2, b=0.75) if chunks else None
+        self.by_company: dict[str, list[int]] = {}
+        self.annual_years: dict[str, set[int]] = {}
+        self.all_vocab: set[str] = set()  # stemmed words of the whole corpus, for the abstention check
+        for i, chunk in enumerate(chunks):
+            meta = chunk.metadata or {}
+            key = company_key(meta.get("company", ""))
+            self.by_company.setdefault(key, []).append(i)
+            self.all_vocab.update(_tokens(chunk.page_content))
+            year = as_year(meta.get("fiscal_year"))
+            if meta.get("doc_type") == "annual_report" and year:
+                # an annual report has the columns of its year and of the year before
+                self.annual_years.setdefault(key, set()).update({year, year - 1})
+            KNOWN_COMPANIES.setdefault(key, meta.get("company", ""))
+
+
+def _rank_company(index: LexicalIndex, key: str, scores, year: int | None, doc_type: str) -> list[int]:
+    """The company's chunks, best first, from the documents that can hold the answer."""
+    ids = index.by_company.get(key, [])
+
+    def allowed(i: int) -> bool:
+        meta = index.chunks[i].metadata
+        if meta.get("doc_type") != doc_type:
+            return False
+        if doc_type == "annual_report" and year is not None:
+            return as_year(meta.get("fiscal_year")) in (year, year + 1)
+        return True
+
+    def score(i: int) -> float:
+        bonus = 0.0
+        if year is not None and as_year(index.chunks[i].metadata.get("fiscal_year")) == year:
+            bonus += 0.5  # the report of the year asked about comes first
+        return scores[i] + bonus
+
+    candidates = [i for i in ids if allowed(i)]
+    if not candidates:
+        return sorted(ids, key=score, reverse=True)
+    ranked = sorted(candidates, key=score, reverse=True)
+    # The question may name the wrong kind of document (a repurchase programme that was only announced
+    # on the call): the best chunk of another kind of document goes second if it matches the question
+    # clearly better than every chunk of the expected documents.
+    others = sorted((i for i in ids if index.chunks[i].metadata.get("doc_type") != doc_type),
+                    key=lambda i: scores[i], reverse=True)
+    better = [i for i in others[:MAX_OTHER_DOCS] if scores[i] > OTHER_DOC_RATIO * max(scores[ranked[0]], 1e-9)]
+    return ranked[:1] + better + ranked[1:]
+
+
+def _unanswerable(index: LexicalIndex, keys: list[str], words: list[str], year: int | None,
+                  doc_type: str) -> str | None:
+    """Why the corpus cannot answer, or None: "company" (not in the corpus), "year" (a year the
+    documents do not cover) or "word" (a question word that occurs nowhere in the corpus, i.e. a
+    figure that is not disclosed, such as lobbying expenses)."""
+    if any(k not in index.by_company for k in keys):
+        return "company"
+    for key in keys:
+        if year is None:
+            continue
+        if doc_type == "annual_report":
+            if year not in index.annual_years.get(key, set()):
+                return "year"
+        else:  # a call or a research report: the year (e.g. a forecast for FY2027) must be in it
+            ids = [i for i in index.by_company.get(key, []) if index.chunks[i].metadata.get("doc_type") == doc_type]
+            pattern = re.compile(rf"(?<!\d){year}(?!\d)")
+            if ids and not any(pattern.search(index.chunks[i].page_content) for i in ids):
+                return "year"
+    for word in words:
+        if word in ANSWER_WORDS:
+            continue
+        options = {_stem(word), *(_stem(s) for s in SYNONYMS.get(word, []))}
+        if not options & index.all_vocab:
+            return "word"
+    return None
+
+
+ANSWER_CHECK_PROMPT = """Below are passages from company reports, and a question about a company.
+
+Passages:
+{context}
+
+Question: {question}
+
+Do the passages state the answer to this question: the figure, name or rating it asks for, for the company and the period it asks about? Reply with one word: YES or NO."""
+_checker: ChatDeepSeek | None = None
+
+
+def _llm_says_answerable(question: str, chunks: list[Document]) -> bool | None:
+    """Ask the LLM whether the chunks answer the question; None if the LLM cannot be reached."""
+    global _checker
+    if not chunks or not os.environ.get("DEEPSEEK_API_KEY"):
+        return None
+    try:
+        if _checker is None:
+            _checker = make_llm(temperature=0.0, max_tokens=5)
+        reply = str(_checker.invoke(ANSWER_CHECK_PROMPT.format(
+            context=format_context(chunks), question=question)).content).strip().upper()
+    except Exception:
+        return None
+    if reply.startswith("YES"):
+        return True
+    if reply.startswith("NO"):
+        return False
+    return None
 
 
 def parse_query(question: str) -> dict:
@@ -62,7 +813,8 @@ def parse_query(question: str) -> dict:
     The rules for each field are under Task 2.2 in the handout. You may use make_llm() here.
     """
     ### YOUR CODE HERE
-    return {}
+    return {"companies": _parse_companies(question), "fiscal_year": _parse_year(question),
+            "doc_type": _parse_doc_type(question)}
 
 
 def build_index(chunks: list[Document]) -> Any:
@@ -71,7 +823,7 @@ def build_index(chunks: list[Document]) -> Any:
     Return anything retrieve() needs: a BM25 or TF-IDF index, the chunks grouped by metadata, ...
     """
     ### YOUR CODE HERE
-    return None
+    return LexicalIndex(chunks)
 
 
 def retrieve(index: Any, question: str) -> list[Document]:
@@ -80,7 +832,57 @@ def retrieve(index: Any, question: str) -> list[Document]:
     Return [] when the corpus cannot answer the question: the generator then answers NOT_FOUND.
     """
     ### YOUR CODE HERE
-    return []
+    if not isinstance(index, LexicalIndex) or not index.chunks:
+        return []
+
+    def best(scores) -> list[Document]:  # BM25 over the whole corpus
+        order = sorted(range(len(index.chunks)), key=lambda i: -scores[i])
+        return [index.chunks[i] for i in order[:MAX_RETRIEVED]]
+
+    if not SETTINGS["metadata_filter"]:  # the baseline: no query parsing, never []
+        return best(index.bm25.get_scores(_query_tokens(question, [])))
+
+    parsed = parse_query(question)
+    names, year, doc_type = parsed["companies"], parsed["fiscal_year"], parsed["doc_type"]
+    keys = [company_key(n) for n in names]
+    words = _query_words(question, names)
+    scores = index.bm25.get_scores(_query_tokens(question, names))  # company names: the filter does that
+
+    reason = None
+    if SETTINGS["abstain"]:
+        reason = _unanswerable(index, keys, words, year, doc_type) if keys else None
+        if reason in ("company", "year"):
+            return []
+    else:
+        keys = [k for k in keys if k in index.by_company]
+    if not keys:  # no company of the corpus named: rank the whole corpus
+        return best(scores)
+
+    boost = SETTINGS["table_boost"]
+    if boost != 1.0 and re.search(FIGURE_QUESTION, question, re.I):
+        # the question asks for a figure, or compares figures, and figures are in tables
+        scores = [s * boost if index.chunks[i].metadata.get("has_table") else s for i, s in enumerate(scores)]
+    ranked = [_rank_company(index, k, scores, year, doc_type) for k in keys]
+    if len(ranked) > 1 and not SETTINGS["per_company"]:  # one ranking of all the companies' chunks
+        picked = sorted({i for ids in ranked for i in ids}, key=lambda i: -scores[i])
+    else:
+        # the companies take turns (the best chunk of each first), up to an equal share each,
+        # then the best of the rest fill up
+        share = max(1, MAX_RETRIEVED // len(keys))
+        picked = []
+        for rank in range(share):
+            for ids in ranked:
+                if rank < len(ids) and ids[rank] not in picked:
+                    picked.append(ids[rank])
+        rest = sorted({i for ids in ranked for i in ids} - set(picked), key=lambda i: -scores[i])
+        picked.extend(rest[:MAX_RETRIEVED - len(picked)])
+    chunks = [index.chunks[i] for i in picked[:MAX_RETRIEVED]]
+
+    if reason == "word":
+        # A question word the corpus never uses usually means the figure is not disclosed, but it may
+        # also be unusual wording: the LLM gets the last word when it can be reached.
+        return chunks if _llm_says_answerable(question, chunks) else []
+    return chunks
 
 
 # =============================================================================

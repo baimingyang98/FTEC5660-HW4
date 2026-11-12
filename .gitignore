@@ -1,0 +1,7 @@
+# API key and local environment
+.env
+.venv/
+__pycache__/
+
+# index files are built from the corpus at run time and are not committed
+*.pkl
